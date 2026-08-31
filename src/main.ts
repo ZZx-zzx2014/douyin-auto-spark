@@ -1,6 +1,6 @@
 import 'dotenv/config'
 import { chromium, type Browser, type Cookie, type Locator, type Page } from 'playwright'
-import { mkdir, readFile } from 'node:fs/promises'
+import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { createInterface } from 'node:readline/promises'
 import { stdin as input, stdout as output } from 'node:process'
 import dayjs from 'dayjs'
@@ -21,6 +21,9 @@ const DOUYIN_TARGET_NAMES_KEY = 'DOUYIN_TARGET_NAMES'
 const YIYAN_INCLUDE_SOURCE_KEY = 'YIYAN_INCLUDE_SOURCE'
 const SPARK_MESSAGE_TEMPLATE_KEY = 'SPARK_MESSAGE_TEMPLATE'
 const FAILURE_SCREENSHOT_DIRECTORY = 'artifacts'
+const DEBUG_ARTIFACT_DIRECTORY = 'artifacts'
+const SEND_VERIFY_TIMEOUT = 8000
+const SEND_VERIFY_POLL_INTERVAL = 500
 
 const CHAT_PAGE_READY_TIMEOUT = 30000
 const CHAT_PAGE_IDLE_TIMEOUT = 10000
@@ -138,6 +141,7 @@ async function runDouyinAccount(
     }
 
     await waitForChatListReady(page, account.name)
+    await captureDebugScreenshot(page, `${account.name}-chat-ready`)
 
     // 记录未命中的会话，等其余好友都发完再统一报错，避免一个人改名连累当天所有人。
     const missingNames: string[] = []
@@ -157,6 +161,7 @@ async function runDouyinAccount(
         continue
       }
 
+      await captureDebugScreenshot(page, `${account.name}-${targetName}-search-found`)
       await searchResult.getByText(/^(发消息|发私信)$/).click({ timeout: 5000 })
       console.log(`[${account.name}] 已打开私信：${targetName}`)
 
@@ -182,9 +187,50 @@ async function runDouyinAccount(
         message = includeYiyanSource ? `${yiyan.hitokoto}\n——「${yiyan.from}」` : yiyan.hitokoto
       }
 
+      // 先清空编辑器，避免上一个会话残留内容混入本次消息。
+      await editorInput.fill('')
+      await editorInput.click()
       await page.keyboard.insertText(message)
-      await page.keyboard.press('Enter')
-      console.log(`[${account.name}] 已发送消息：${targetName}`)
+
+      // 验证消息确实进入了 Slate 编辑器，而不是只验证 click/keyboard 没有报错。
+      const editorTextBeforeSend = await editorInput.innerText().catch(() => '')
+      if (normalizeVisibleText(editorTextBeforeSend) !== normalizeVisibleText(message)) {
+        await captureDebugScreenshot(page, `${account.name}-${targetName}-before-send`)
+        throw new Error(
+          `消息未正确写入输入框：${targetName}。期望长度=${message.length}，实际长度=${editorTextBeforeSend.length}`,
+        )
+      }
+
+      await captureDebugScreenshot(page, `${account.name}-${targetName}-before-send`)
+      console.log(
+        `[${account.name}] 消息已写入输入框，准备发送：${targetName}（${message.length} 字符）`,
+      )
+
+      // 键盘事件只发送给实际编辑器，避免 page.keyboard 因焦点丢失而操作到其他控件。
+      await editorInput.press('Enter')
+      console.log(`[${account.name}] 已触发发送操作：${targetName}`)
+
+      // 抖音网页端发送后会清空编辑器；如果编辑器仍保留原文，通常说明 Enter 没有被发送控件处理。
+      const editorCleared = await waitForEditorToClear(editorInput)
+      if (!editorCleared) {
+        await captureDebugScreenshot(page, `${account.name}-${targetName}-send-not-cleared`)
+        throw new Error(`发送后输入框没有清空，消息可能没有真正发送：${targetName}`)
+      }
+
+      // 最终验证：聊天页面 DOM 中出现本次刚发送的完整文本。
+      const messageVerified = await waitForSentMessage(page, message)
+      await captureDebugScreenshot(
+        page,
+        `${account.name}-${targetName}-${messageVerified ? 'sent' : 'send-unverified'}`,
+      )
+
+      if (!messageVerified) {
+        throw new Error(
+          `发送动作已触发，但在 ${SEND_VERIFY_TIMEOUT} 毫秒内没有在聊天区域检测到消息：${targetName}`,
+        )
+      }
+
+      console.log(`[${account.name}] ✅ 已确认消息出现在聊天页面：${targetName}`)
       await page.waitForTimeout(1000)
     }
 
@@ -288,6 +334,96 @@ async function searchConversation(
   }
 
   return undefined
+}
+
+/**
+ * 等待消息编辑器被抖音清空。
+ *
+ * 发送成功后，Slate 编辑器通常会清空；如果 Enter 没有触发发送，
+ * 原消息会继续留在编辑器中。这个检查可以过滤掉最常见的「按键执行成功
+ * 但消息实际上没有发送」情况。
+ */
+async function waitForEditorToClear(editorInput: Locator): Promise<boolean> {
+  const deadline = Date.now() + SEND_VERIFY_TIMEOUT
+
+  while (Date.now() < deadline) {
+    const text = await editorInput.innerText().catch(() => '')
+    if (!text.trim()) {
+      return true
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, SEND_VERIFY_POLL_INTERVAL))
+  }
+
+  return false
+}
+
+/**
+ * 在聊天页面 DOM 中确认刚发送的消息已经出现。
+ *
+ * 不依赖某一个易变的抖音 CSS class，而是从页面可见文本中确认完整消息。
+ * 对超长消息做轻微轮询，给 React/网络请求留出渲染时间。
+ */
+async function waitForSentMessage(page: Page, message: string): Promise<boolean> {
+  const normalizedMessage = normalizeVisibleText(message)
+
+  if (!normalizedMessage) {
+    return false
+  }
+
+  const deadline = Date.now() + SEND_VERIFY_TIMEOUT
+
+  while (Date.now() < deadline) {
+    const bodyText = await page.locator('body').innerText().catch(() => '')
+    if (normalizeVisibleText(bodyText).includes(normalizedMessage)) {
+      return true
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, SEND_VERIFY_POLL_INTERVAL))
+  }
+
+  return false
+}
+
+/**
+ * 统一处理换行、连续空白，便于比较聊天页面渲染后的文本。
+ */
+function normalizeVisibleText(value: string): string {
+  return value.replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim()
+}
+
+/**
+ * 保存可复现问题的调试截图，并记录当前页面 URL/标题。
+ */
+async function captureDebugScreenshot(page: Page | undefined, label: string): Promise<void> {
+  if (!page || page.isClosed()) {
+    return
+  }
+
+  try {
+    await mkdir(DEBUG_ARTIFACT_DIRECTORY, { recursive: true })
+
+    const safeLabel = toSafeFileName(label)
+    const screenshotPath = `${DEBUG_ARTIFACT_DIRECTORY}/debug-${safeLabel}.png`
+    const metadataPath = `${DEBUG_ARTIFACT_DIRECTORY}/debug-${safeLabel}.json`
+
+    await page.screenshot({
+      path: screenshotPath,
+      fullPage: true,
+    })
+
+    const metadata = {
+      label,
+      url: page.url(),
+      title: await page.title().catch(() => ''),
+      capturedAt: new Date().toISOString(),
+    }
+
+    await writeFile(metadataPath, JSON.stringify(metadata, null, 2), 'utf8')
+    console.log(`已保存调试现场：${screenshotPath}`)
+  } catch (error) {
+    console.error(`保存调试现场失败：${label}`, error)
+  }
 }
 
 /**
